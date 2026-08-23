@@ -1,17 +1,40 @@
 # notability2pdf
 
-Convert Notability `.note` backup files (e.g. from Google Drive auto-backup)
-to PDF — no Notability app required.
+Convert Notability notes to PDF — no Notability app required.
+Handles both formats:
+
+- **`.note`** — zipped export (e.g. from Google Drive auto-backup, or manual
+  "Export As → Note" on iPad/Mac).
+- **`.nbn`** — Notability's *native* on-disk bundle (a directory), as used by
+  Notability's built-in iCloud Sync. Fork of upstream to add this — means you
+  can convert directly from Notability's iCloud container on macOS without
+  first setting up a third-party auto-backup destination.
 
 ## Usage
 
 ```sh
+# .note zips or .nbn bundles — batch a whole tree at once
 ./convert.py ~/Downloads/Notability ~/Downloads/Notability-PDF
+
+# Or point straight at Notability's iCloud sync folder on macOS
+./convert.py \
+  "$HOME/Library/Mobile Documents/<TEAM_ID>~com~gingerlabs~Notability/Documents" \
+  ~/Documents/notability-export
+```
+
+The `<TEAM_ID>` prefix (e.g. `ZP9ZJ4EF3S`) can be discovered with:
+
+```sh
+ls "$HOME/Library/Mobile Documents/" | grep gingerlabs
 ```
 
 Requires [uv](https://docs.astral.sh/uv/); dependencies (PyMuPDF, Pillow) are
-resolved automatically from the script header. Pass a single `.note` file or a
-directory tree — the folder structure is mirrored into the output directory.
+resolved automatically from the script header. If your default Python is 3.14
+free-threaded (`Py_GIL_DISABLED=1`), PyMuPDF won't build — pin to 3.12:
+
+```sh
+uv run --python 3.12 --script convert.py …
+```
 
 Flags:
 

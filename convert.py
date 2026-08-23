@@ -142,13 +142,21 @@ class Page:
 class Note:
     def __init__(self, path: Path):
         self.path = path
-        self.zip = zipfile.ZipFile(path)
-        names = self.zip.namelist()
-        self.folder = names[0].split("/")[0]
-        self.arc = Archive(self.zip.read(f"{self.folder}/Session.plist"))
+        # .nbn = Notability's native bundle (a directory), .note = zipped export
+        if path.is_dir():
+            self.zip = None
+            self.folder = path.name
+            self.arc = Archive((path / "Session.plist").read_bytes())
+        else:
+            self.zip = zipfile.ZipFile(path)
+            names = self.zip.namelist()
+            self.folder = names[0].split("/")[0]
+            self.arc = Archive(self.zip.read(f"{self.folder}/Session.plist"))
         self.warnings = []
 
     def read_member(self, relpath):
+        if self.zip is None:
+            return (self.path / relpath).read_bytes()
         return self.zip.read(f"{self.folder}/{relpath}")
 
     # -- paper geometry
@@ -319,10 +327,17 @@ class Note:
         return pages
 
     def recordings(self):
+        exts = (".m4a", ".caf", ".aac", ".mp3", ".wav")
+        if self.zip is None:
+            rec_dir = self.path / "Recordings"
+            if not rec_dir.exists():
+                return []
+            return [str(p.relative_to(self.path.parent)) for p in rec_dir.iterdir()
+                    if p.is_file() and p.suffix.lower() in exts]
         prefix = f"{self.folder}/Recordings/"
         return [
             n for n in self.zip.namelist()
-            if n.startswith(prefix) and n.lower().endswith((".m4a", ".caf", ".aac", ".mp3", ".wav"))
+            if n.startswith(prefix) and n.lower().endswith(exts)
         ]
 
 
@@ -439,10 +454,14 @@ def convert_note(note_path: Path, out_pdf: Path, extract_audio=False):
     if extract_audio:
         for member in note.recordings():
             target = out_pdf.parent / f"{out_pdf.stem}_{Path(member).name}"
-            target.write_bytes(note.zip.read(member))
+            if note.zip is None:
+                target.write_bytes((note.path.parent / member).read_bytes())
+            else:
+                target.write_bytes(note.zip.read(member))
             audio_files.append(target)
 
-    note.zip.close()
+    if note.zip is not None:
+        note.zip.close()
     return note.warnings, audio_files
 
 
@@ -456,14 +475,20 @@ def main():
     ap.add_argument("--audio", action="store_true", help="also extract audio recordings")
     args = ap.parse_args()
 
-    if args.input.is_file():
+    # A .nbn is a directory bundle; a .note is a zip file.
+    if args.input.suffix == ".nbn" and args.input.is_dir():
+        note_files = [args.input]
+        base = args.input.parent
+    elif args.input.is_file():
         note_files = [args.input]
         base = args.input.parent
     else:
         note_files = sorted(args.input.rglob("*.note"))
+        # Also include .nbn bundles (which are directories, not files, so use glob differently)
+        note_files += sorted(p for p in args.input.rglob("*.nbn") if p.is_dir())
         base = args.input
     if not note_files:
-        sys.exit(f"no .note files found under {args.input}")
+        sys.exit(f"no .note or .nbn files found under {args.input}")
 
     ok = skipped = failed = 0
     for i, nf in enumerate(note_files, 1):
