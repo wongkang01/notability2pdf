@@ -6,9 +6,9 @@ Handles both formats:
 - **`.note`** — zipped export (e.g. from Google Drive auto-backup, or manual
   "Export As → Note" on iPad/Mac).
 - **`.nbn`** — Notability's *native* on-disk bundle (a directory), as used by
-  Notability's built-in iCloud Sync. Fork of upstream to add this — means you
-  can convert directly from Notability's iCloud container on macOS without
-  first setting up a third-party auto-backup destination.
+  Notability's built-in iCloud Sync, so you can convert directly from
+  Notability's iCloud container on macOS without first setting up a
+  third-party auto-backup destination.
 
 ## Usage
 
