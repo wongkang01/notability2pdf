@@ -142,18 +142,31 @@ class Page:
 class Note:
     def __init__(self, path: Path):
         self.path = path
-        self.zip = zipfile.ZipFile(path)
-        names = self.zip.namelist()
-        self.folder = names[0].split("/")[0]
-        self.arc = Archive(self.zip.read(f"{self.folder}/Session.plist"))
+        # .nbn = Notability's native bundle (a directory), .note = zipped export
+        if path.is_dir():
+            self.zip = None
+            self.folder = path.name
+            self.arc = Archive((path / "Session.plist").read_bytes())
+        else:
+            self.zip = zipfile.ZipFile(path)
+            names = self.zip.namelist()
+            self.folder = names[0].split("/")[0]
+            self.arc = Archive(self.zip.read(f"{self.folder}/Session.plist"))
         self.warnings = []
 
     def read_member(self, relpath):
+        if self.zip is None:
+            return (self.path / relpath).read_bytes()
         return self.zip.read(f"{self.folder}/{relpath}")
 
     # -- paper geometry
+    def _paper_attrs(self):
+        # Older notes used GLModel.PaperAttributes; newer notes use Notability.PaperAttributes.
+        return (self.arc.find("Notability.PaperAttributes")
+                or self.arc.find("GLModel.PaperAttributes"))
+
     def note_width(self):
-        pa = self.arc.find("GLModel.PaperAttributes")
+        pa = self._paper_attrs()
         if pa:
             sizing = self.arc.deref(pa.get("paperSizingBehavior", ""))
             if isinstance(sizing, dict):
@@ -166,7 +179,7 @@ class Note:
         return DEFAULT_NOTE_WIDTH
 
     def paper_page_height(self, width):
-        pa = self.arc.find("GLModel.PaperAttributes")
+        pa = self._paper_attrs()
         aspect = LETTER_ASPECT
         if pa:
             orient = self.arc.deref(pa.get("paperOrientation", "portrait"))
@@ -175,6 +188,43 @@ class Note:
             if orient == "landscape":
                 aspect = 1.0 / LETTER_ASPECT
         return width * aspect
+
+    # -- paper style (lines / grid / dots + optional custom template PDF)
+    def _paper_attr(self, key):
+        pa = self._paper_attrs()
+        if not pa or key not in pa:
+            return None
+        v = self.arc.deref(pa[key])
+        if isinstance(v, dict):
+            v = v.get("NS.string", "")
+        return v if isinstance(v, str) else None
+
+    def paper_line_style(self):
+        """Return (kind, multiplier) where kind is 'lines'|'grid'|'dots'|'none'."""
+        raw = self._paper_attr("lineStyle2") or ""
+        if not raw or raw == "No Lines":
+            return ("none", 1.0)
+        parts = raw.split(":")
+        head = parts[0].lower()
+        if head not in ("lines", "grid", "dots"):
+            return ("none", 1.0)
+        # 'Lines:1.0' -> mult 1.0
+        # 'Lines:false:false:0.5' -> last numeric field is the size in inches
+        mult = 1.0
+        for tail in reversed(parts[1:]):
+            try:
+                mult = float(tail)
+                break
+            except ValueError:
+                continue
+        return (head, mult)
+
+    def paper_template_uuid(self):
+        """UUID of a custom-template PDF stored inside the .nbn under PDFs/, or None."""
+        raw = self._paper_attr("paperIdentifier") or ""
+        if raw.startswith("TemplatePDF:"):
+            return raw.split(":", 2)[1]
+        return None
 
     # -- strokes
     def strokes(self):
@@ -319,14 +369,68 @@ class Note:
         return pages
 
     def recordings(self):
+        exts = (".m4a", ".caf", ".aac", ".mp3", ".wav")
+        if self.zip is None:
+            rec_dir = self.path / "Recordings"
+            if not rec_dir.exists():
+                return []
+            return [str(p.relative_to(self.path.parent)) for p in rec_dir.iterdir()
+                    if p.is_file() and p.suffix.lower() in exts]
         prefix = f"{self.folder}/Recordings/"
         return [
             n for n in self.zip.namelist()
-            if n.startswith(prefix) and n.lower().endswith((".m4a", ".caf", ".aac", ".mp3", ".wav"))
+            if n.startswith(prefix) and n.lower().endswith(exts)
         ]
 
 
 # ------------------------------------------------------------------ rendering
+
+# College-ruled blue, close to Notability's on-screen ruled line
+PAPER_LINE_RGB = (0.62, 0.78, 0.92)
+# 24pt = ~1/3 inch — matches Notability's default ruled spacing at multiplier 1.0
+PAPER_LINE_BASE = 24.0
+
+
+def draw_paper_pattern(page, kind, mult, width, height):
+    """Overlay lines/grid/dots on a blank page."""
+    if kind == "none":
+        return
+    # 'Lines:1.0' → 24pt; 'Lines:false:false:0.5' → 0.5 inch = 36pt
+    if 0 < mult <= 2.0:
+        spacing = PAPER_LINE_BASE * mult
+    else:
+        spacing = mult * 72.0  # value was in inches
+    if spacing < 6:
+        spacing = 6
+    shape = page.new_shape()
+    if kind == "lines":
+        y = spacing
+        while y < height:
+            shape.draw_line(fitz.Point(0, y), fitz.Point(width, y))
+            y += spacing
+        shape.finish(color=PAPER_LINE_RGB, width=0.4, stroke_opacity=1.0)
+    elif kind == "grid":
+        y = spacing
+        while y < height:
+            shape.draw_line(fitz.Point(0, y), fitz.Point(width, y))
+            y += spacing
+        x = spacing
+        while x < width:
+            shape.draw_line(fitz.Point(x, 0), fitz.Point(x, height))
+            x += spacing
+        shape.finish(color=PAPER_LINE_RGB, width=0.4, stroke_opacity=1.0)
+    elif kind == "dots":
+        r = 0.6
+        y = spacing
+        while y < height:
+            x = spacing
+            while x < width:
+                shape.draw_circle(fitz.Point(x, y), r)
+                x += spacing
+            y += spacing
+        shape.finish(color=PAPER_LINE_RGB, fill=PAPER_LINE_RGB, width=0)
+    shape.commit()
+
 
 def convert_note(note_path: Path, out_pdf: Path, extract_audio=False):
     note = Note(note_path)
@@ -357,6 +461,19 @@ def convert_note(note_path: Path, out_pdf: Path, extract_audio=False):
                 note.warnings.append(f"embedded pdf {pg.pdf_name} unreadable: {e}")
                 pdf_docs[pg.pdf_name] = None
 
+    # custom-template PDF background (paperIdentifier = TemplatePDF:UUID:...)
+    template_doc = None
+    template_uuid = note.paper_template_uuid()
+    if template_uuid:
+        try:
+            template_doc = fitz.open(
+                stream=note.read_member(f"PDFs/{template_uuid}.pdf"), filetype="pdf"
+            )
+        except Exception as e:
+            note.warnings.append(f"paper template pdf {template_uuid} unreadable: {e}")
+
+    line_kind, line_mult = note.paper_line_style()
+
     # page heights in note coordinates
     paper_h = note.paper_page_height(width)
     for pg in pages:
@@ -380,6 +497,10 @@ def convert_note(note_path: Path, out_pdf: Path, extract_audio=False):
         else:
             scale = 1.0
             page = doc.new_page(width=width, height=pg.height)
+            # Blank page: apply custom-template background (if any) and/or line pattern
+            if template_doc is not None and template_doc.page_count > 0:
+                page.show_pdf_page(page.rect, template_doc, 0)
+            draw_paper_pattern(page, line_kind, line_mult, width, pg.height)
 
         y1 = y0 + pg.height
 
@@ -434,15 +555,21 @@ def convert_note(note_path: Path, out_pdf: Path, extract_audio=False):
     for d in pdf_docs.values():
         if d is not None:
             d.close()
+    if template_doc is not None:
+        template_doc.close()
 
     audio_files = []
     if extract_audio:
         for member in note.recordings():
             target = out_pdf.parent / f"{out_pdf.stem}_{Path(member).name}"
-            target.write_bytes(note.zip.read(member))
+            if note.zip is None:
+                target.write_bytes((note.path.parent / member).read_bytes())
+            else:
+                target.write_bytes(note.zip.read(member))
             audio_files.append(target)
 
-    note.zip.close()
+    if note.zip is not None:
+        note.zip.close()
     return note.warnings, audio_files
 
 
@@ -456,14 +583,20 @@ def main():
     ap.add_argument("--audio", action="store_true", help="also extract audio recordings")
     args = ap.parse_args()
 
-    if args.input.is_file():
+    # A .nbn is a directory bundle; a .note is a zip file.
+    if args.input.suffix == ".nbn" and args.input.is_dir():
+        note_files = [args.input]
+        base = args.input.parent
+    elif args.input.is_file():
         note_files = [args.input]
         base = args.input.parent
     else:
         note_files = sorted(args.input.rglob("*.note"))
+        # Also include .nbn bundles (which are directories, not files, so use glob differently)
+        note_files += sorted(p for p in args.input.rglob("*.nbn") if p.is_dir())
         base = args.input
     if not note_files:
-        sys.exit(f"no .note files found under {args.input}")
+        sys.exit(f"no .note or .nbn files found under {args.input}")
 
     ok = skipped = failed = 0
     for i, nf in enumerate(note_files, 1):
